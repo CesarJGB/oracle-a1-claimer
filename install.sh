@@ -53,6 +53,14 @@ sudo install -o root -g root -m 0644 \
   "${SOURCE_DIR}/systemd/oci-a1-heartbeat.timer" \
   /etc/systemd/system/oci-a1-heartbeat.timer
 
+# runtime.json lo crea el claimer de forma atómica. Si ya existe de una
+# instalación anterior, conserva sus métricas pero corrige propietario y modo.
+RUNTIME_PATH="/var/lib/oci-a1-claimer/runtime.json"
+if [[ -f "${RUNTIME_PATH}" ]]; then
+  sudo chown "${SERVICE_USER}:${SERVICE_GROUP}" "${RUNTIME_PATH}"
+  sudo chmod 0600 "${RUNTIME_PATH}"
+fi
+
 if [[ -f "${SOURCE_DIR}/.env" ]]; then
   sudo install -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0600 \
     "${SOURCE_DIR}/.env" /etc/oci-a1-claimer/claimer.env
