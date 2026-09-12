@@ -1,0 +1,24 @@
+[Unit]
+Description=OCI Always Free Ampere A1 claimer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=__OCI_A1_USER__
+Group=__OCI_A1_GROUP__
+WorkingDirectory=/opt/oci-a1-claimer
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/oci-a1-claimer/claimer.env
+ExecStart=/opt/oci-a1-claimer/.venv/bin/python /opt/oci-a1-claimer/oci_a1_claimer.py
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/oci-a1-claimer
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

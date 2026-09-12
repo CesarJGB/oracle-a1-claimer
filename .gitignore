@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+instance.json
+instance.lock
+*.lock
+.pytest_cache/
