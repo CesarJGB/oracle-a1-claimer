@@ -1,0 +1,11 @@
+[Unit]
+Description=Send the OCI A1 claimer heartbeat every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+Unit=oci-a1-heartbeat.service
+
+[Install]
+WantedBy=timers.target
