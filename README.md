@@ -18,6 +18,7 @@ navegador, no intenta saltarse CAPTCHA ni crea cuentas. Cuando OCI devuelve
 6. Intenta crear una sola instancia con el nombre configurado y una clave SSH pública.
 7. Usa un token de idempotencia durante reintentos de red y comprueba el nombre antes de volver a crear.
 8. Guarda el OCID/IP en un archivo local y puede avisar por Telegram.
+9. Puede enviar un heartbeat horario con el estado y las métricas de la última hora.
 
 El capacity report no reserva capacidad: la disponibilidad puede cambiar entre
 la consulta y la creación. Por eso el script también realiza un intento real de
@@ -151,8 +152,24 @@ TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 ```
 
-El bot no es necesario para reclamar la instancia; solo se utiliza después de
-una creación exitosa.
+El bot no es necesario para reclamar la instancia. Se utiliza para avisar
+cuando la creación termina y para el heartbeat horario instalado con el
+servicio. El heartbeat muestra si el claimer sigue activo y cuenta en los logs
+de la última hora:
+
+- comprobaciones de capacidad;
+- intentos directos de creación;
+- intentos rechazados por falta de capacidad;
+- respuestas `HTTP 429` de rate limit.
+
+El heartbeat lee de `claimer.env` únicamente `TELEGRAM_BOT_TOKEN` y
+`TELEGRAM_CHAT_ID`; no ejecuta ni carga el archivo completo como código shell.
+Así, valores con espacios como `OCI_IMAGE_OS=Canonical Ubuntu` no provocan el
+error `Ubuntu: command not found`.
+
+Cuando existe `/var/lib/oci-a1-claimer/instance.json`, el heartbeat deja de
+enviar mensajes porque la instancia ya fue creada y el claimer envía su propia
+notificación final.
 
 ## 5. Dejarlo como servicio en Ubuntu
 
@@ -170,8 +187,17 @@ absolutas para `OCI_CONFIG_FILE` y `OCI_SSH_PUBLIC_KEY_PATH`. Después:
 ```bash
 sudo chmod 600 /etc/oci-a1-claimer/claimer.env
 sudo systemctl enable --now oci-a1-claimer
+sudo systemctl enable --now oci-a1-heartbeat.timer
 sudo systemctl status oci-a1-claimer
+systemctl list-timers oci-a1-heartbeat.timer --no-pager
 sudo journalctl -u oci-a1-claimer -f
+```
+
+Puedes comprobar el mensaje sin esperar a la siguiente hora:
+
+```bash
+sudo systemctl start oci-a1-heartbeat.service
+sudo journalctl -u oci-a1-heartbeat.service -n 20 --no-pager
 ```
 
 Cuando la creación sea exitosa, el servicio detectará la instancia por su
@@ -185,6 +211,7 @@ Para detenerlo manualmente:
 
 ```bash
 sudo systemctl disable --now oci-a1-claimer
+sudo systemctl disable --now oci-a1-heartbeat.timer
 ```
 
 ## Errores habituales

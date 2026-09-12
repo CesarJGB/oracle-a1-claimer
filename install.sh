@@ -15,6 +15,11 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Falta curl. Instálalo primero (Ubuntu: sudo apt update && sudo apt install -y curl)." >&2
+  exit 1
+fi
+
 sudo install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0750 /opt/oci-a1-claimer
 sudo install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0750 /etc/oci-a1-claimer
 sudo install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0700 /var/lib/oci-a1-claimer
@@ -38,6 +43,15 @@ sed \
   "${SOURCE_DIR}/systemd/oci-a1-claimer.service" > "${SERVICE_TMP}"
 sudo install -o root -g root -m 0644 "${SERVICE_TMP}" \
   /etc/systemd/system/oci-a1-claimer.service
+sudo install -o root -g root -m 0755 \
+  "${SOURCE_DIR}/scripts/oci-a1-heartbeat.sh" \
+  /usr/local/bin/oci-a1-heartbeat.sh
+sudo install -o root -g root -m 0644 \
+  "${SOURCE_DIR}/systemd/oci-a1-heartbeat.service" \
+  /etc/systemd/system/oci-a1-heartbeat.service
+sudo install -o root -g root -m 0644 \
+  "${SOURCE_DIR}/systemd/oci-a1-heartbeat.timer" \
+  /etc/systemd/system/oci-a1-heartbeat.timer
 
 if [[ -f "${SOURCE_DIR}/.env" ]]; then
   sudo install -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0600 \
@@ -52,4 +66,5 @@ echo
 echo "Instalación terminada para el usuario ${SERVICE_USER}."
 echo "Edita /etc/oci-a1-claimer/claimer.env y después ejecuta:"
 echo "  sudo systemctl enable --now oci-a1-claimer"
+echo "  sudo systemctl enable --now oci-a1-heartbeat.timer"
 echo "  sudo journalctl -u oci-a1-claimer -f"
