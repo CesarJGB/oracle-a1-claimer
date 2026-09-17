@@ -39,6 +39,7 @@ read_setting() {
 
 TELEGRAM_BOT_TOKEN="$(read_setting TELEGRAM_BOT_TOKEN)"
 TELEGRAM_CHAT_ID="$(read_setting TELEGRAM_CHAT_ID)"
+CANDIDATE_TTL_SECONDS="${OCI_CAPACITY_CANDIDATE_TTL_SECONDS:-$(read_setting OCI_CAPACITY_CANDIDATE_TTL_SECONDS)}"
 
 if [[ -z "${TELEGRAM_BOT_TOKEN}" || -z "${TELEGRAM_CHAT_ID}" ]]; then
   echo "Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en ${ENV_FILE}." >&2
@@ -93,6 +94,13 @@ except ImportError:
 
 runtime_path = sys.argv[1]
 service_since = sys.argv[2]
+candidate_ttl_raw = sys.argv[3] if len(sys.argv) > 3 else ""
+try:
+    candidate_ttl = int(candidate_ttl_raw)
+    if candidate_ttl <= 0:
+        candidate_ttl = 180
+except (TypeError, ValueError):
+    candidate_ttl = 180
 logs = sys.stdin.read()
 now = time.time()
 runtime = None
@@ -260,7 +268,7 @@ if runtime is not None:
         for cand in pending_list:
             if isinstance(cand, dict):
                 obs = timestamp(cand.get("observed_at"))
-                if obs is not None and (now - obs) <= 180:
+                if obs is not None and (now - obs) <= candidate_ttl:
                     fresh_count += 1
         if fresh_count > 0:
             extra_status.append(f"⚡ Candidatos capacity frescos: {fresh_count}")
@@ -289,7 +297,7 @@ message = (
     f"Próximo intento real: {visible_time(next_allowed)}"
 )
 print(message)
-' "${RUNTIME_FILE}" "${service_since}" <<<"${logs_last_hour}"
+' "${RUNTIME_FILE}" "${service_since}" "${CANDIDATE_TTL_SECONDS}" <<<"${logs_last_hour}"
   )"
 else
   message="🔴 Oracle A1 Claimer detenido"

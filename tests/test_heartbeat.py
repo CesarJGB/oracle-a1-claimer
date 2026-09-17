@@ -35,6 +35,8 @@ class HeartbeatTest(unittest.TestCase):
         runtime=None,
         logs=None,
         journal_marker=None,
+        extra_env=None,
+        process_env=None,
     ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -46,17 +48,16 @@ class HeartbeatTest(unittest.TestCase):
         runtime_file = base / "runtime.json"
         capture_file = base / "telegram.txt"
 
-        env_file.write_text(
-            "\n".join(
-                [
-                    "OCI_IMAGE_OS=Canonical Ubuntu",
-                    "TELEGRAM_BOT_TOKEN=test-token",
-                    "TELEGRAM_CHAT_ID=123456",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        env_lines = [
+            "OCI_IMAGE_OS=Canonical Ubuntu",
+            "TELEGRAM_BOT_TOKEN=test-token",
+            "TELEGRAM_CHAT_ID=123456",
+        ]
+        if extra_env:
+            for key, value in extra_env.items():
+                env_lines.append(f"{key}={value}")
+        env_lines.append("")
+        env_file.write_text("\n".join(env_lines), encoding="utf-8")
         if created:
             state_file.write_text("{}\n", encoding="utf-8")
         if runtime == "corrupt":
@@ -106,6 +107,8 @@ fi
                 "HEARTBEAT_CAPTURE_FILE": str(capture_file),
             }
         )
+        if process_env:
+            environment.update(process_env)
         result = subprocess.run(
             ["bash", str(SCRIPT)],
             check=False,
@@ -232,6 +235,152 @@ fi
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("⏱ Intervalo directo actual: 195 s", captured)
+        self.assertIn("⚡ Candidatos capacity frescos: 1", captured)
+
+    def test_candidate_ttl_default_180s(self):
+        runtime = self.limited_runtime()
+        runtime["pending_candidates"] = [
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-1",
+                "observed_at": self.timestamp(-150),
+            },
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-2",
+                "observed_at": self.timestamp(-210),
+            },
+        ]
+        result, captured = self.run_heartbeat(runtime=runtime)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("⚡ Candidatos capacity frescos: 1", captured)
+
+    def test_candidate_ttl_custom_greater_value(self):
+        runtime = self.limited_runtime()
+        runtime["pending_candidates"] = [
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-1",
+                "observed_at": self.timestamp(-250),
+            },
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-2",
+                "observed_at": self.timestamp(-350),
+            },
+        ]
+        result, captured = self.run_heartbeat(
+            runtime=runtime,
+            extra_env={"OCI_CAPACITY_CANDIDATE_TTL_SECONDS": "300"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("⚡ Candidatos capacity frescos: 1", captured)
+
+    def test_candidate_ttl_custom_smaller_value(self):
+        runtime = self.limited_runtime()
+        # Con TTL=120, un candidato de hace 150 s ya no es fresco
+        runtime["pending_candidates"] = [
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-1",
+                "observed_at": self.timestamp(-150),
+            },
+        ]
+        result, captured = self.run_heartbeat(
+            runtime=runtime,
+            extra_env={"OCI_CAPACITY_CANDIDATE_TTL_SECONDS": "120"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("⚡ Candidatos capacity frescos", captured)
+
+        # Con uno de 60 s y uno de 150 s, solo se cuenta el de 60 s
+        runtime["pending_candidates"].append(
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-2",
+                "observed_at": self.timestamp(-60),
+            }
+        )
+        result2, captured2 = self.run_heartbeat(
+            runtime=runtime,
+            extra_env={"OCI_CAPACITY_CANDIDATE_TTL_SECONDS": "120"},
+        )
+        self.assertEqual(result2.returncode, 0, result2.stderr)
+        self.assertIn("⚡ Candidatos capacity frescos: 1", captured2)
+
+    def test_candidate_ttl_empty_or_missing(self):
+        runtime = self.limited_runtime()
+        runtime["pending_candidates"] = [
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-1",
+                "observed_at": self.timestamp(-150),
+            },
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-2",
+                "observed_at": self.timestamp(-210),
+            },
+        ]
+        # Variable vacía en claimer.env -> usa default 180s
+        result_empty_file, captured_empty_file = self.run_heartbeat(
+            runtime=runtime,
+            extra_env={"OCI_CAPACITY_CANDIDATE_TTL_SECONDS": ""},
+        )
+        self.assertEqual(result_empty_file.returncode, 0, result_empty_file.stderr)
+        self.assertIn("⚡ Candidatos capacity frescos: 1", captured_empty_file)
+
+        # Variable vacía en process_env -> usa default 180s
+        result_empty_proc, captured_empty_proc = self.run_heartbeat(
+            runtime=runtime,
+            process_env={"OCI_CAPACITY_CANDIDATE_TTL_SECONDS": ""},
+        )
+        self.assertEqual(result_empty_proc.returncode, 0, result_empty_proc.stderr)
+        self.assertIn("⚡ Candidatos capacity frescos: 1", captured_empty_proc)
+
+    def test_candidate_ttl_invalid_values_fallback_safely(self):
+        runtime = self.limited_runtime()
+        runtime["pending_candidates"] = [
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-1",
+                "observed_at": self.timestamp(-150),
+            },
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-2",
+                "observed_at": self.timestamp(-210),
+            },
+        ]
+        invalid_cases = ["invalid_text", "0", "-60", "  "]
+        for invalid_val in invalid_cases:
+            with self.subTest(invalid_val=invalid_val):
+                result, captured = self.run_heartbeat(
+                    runtime=runtime,
+                    extra_env={"OCI_CAPACITY_CANDIDATE_TTL_SECONDS": invalid_val},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("⚡ Candidatos capacity frescos: 1", captured)
+
+    def test_candidate_ttl_process_env_overrides_env_file(self):
+        runtime = self.limited_runtime()
+        # Candidato de hace 250 s
+        runtime["pending_candidates"] = [
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-1",
+                "observed_at": self.timestamp(-250),
+            },
+        ]
+        # env_file dice 120s (no fresco), pero process_env dice 300s (fresco)
+        result, captured = self.run_heartbeat(
+            runtime=runtime,
+            extra_env={"OCI_CAPACITY_CANDIDATE_TTL_SECONDS": "120"},
+            process_env={"OCI_CAPACITY_CANDIDATE_TTL_SECONDS": "300"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("⚡ Candidatos capacity frescos: 1", captured)
 
 
