@@ -20,9 +20,9 @@ creación para evitar ráfagas.
    fallos temporales con backoff.
 6. Elige como máximo un candidato por ciclo y ejecuta como máximo una llamada
    real a `launch_instance` por ciclo.
-7. Rota `FAULT-DOMAIN-1`, `FAULT-DOMAIN-2` y `FAULT-DOMAIN-3` en fallback; la
-   posición se guarda en `runtime.json` y también respeta
-   `OCI_FALLBACK_FAULT_DOMAINS`.
+7. En fallback directo usa selección automática de fault domain por defecto
+   (`OCI_DIRECT_FAULT_DOMAIN_MODE=auto`), permitiendo al scheduler de OCI ubicar
+   la instancia, o rotación secuencial (`rotate`) con persistencia en `runtime.json`.
 8. Usa un token de idempotencia durante reintentos ambiguos y comprueba el
    nombre antes de repetirlos.
 9. Guarda el OCID/IP en `instance.json`, exclusivamente después de una
@@ -32,37 +32,43 @@ creación para evitar ráfagas.
 
 El capacity report no reserva capacidad: la disponibilidad puede cambiar entre
 la consulta y la creación. Por eso el script también realiza un intento real de
-creación cuando corresponde. Si devuelve varios fault domains disponibles,
-todos se conservan en una cola persistida y se usa solo uno por ciclo.
+creación cuando corresponde. Los candidatos descubiertos se guardan como hints
+temporales con TTL (`OCI_CAPACITY_CANDIDATE_TTL_SECONDS`, 180 s por defecto),
+priorizando siempre los más recientes y deduplicándolos automáticamente.
 
 ## Estrategia de comprobación y creación
 
 `OCI_INTERVAL_SECONDS` y `OCI_JITTER_SECONDS` controlan las revisiones del
 capacity report, no las creaciones. Cuando no se reporta capacidad, una
-solicitud directa se permite cada `OCI_DIRECT_ATTEMPT_INTERVAL_SECONDS` con la
-variación de `OCI_DIRECT_ATTEMPT_JITTER_SECONDS`. Los valores predeterminados
-son 240±30 segundos: unas 15 solicitudes reales por hora en promedio. Siempre
-se respeta `OCI_MIN_LAUNCH_GAP_SECONDS` (60 segundos por defecto).
+solicitud directa se permite según el ritmo adaptativo (`OCI_ADAPTIVE_DIRECT_INTERVAL=true`)
+que parte de `OCI_DIRECT_ATTEMPT_INTERVAL_SECONDS` (240 s por defecto) y se ajusta
+gradualmente entre `OCI_ADAPTIVE_MIN_INTERVAL_SECONDS` (120 s) y `OCI_ADAPTIVE_MAX_INTERVAL_SECONDS`
+(600 s), con jitter aleatorio (`OCI_DIRECT_ATTEMPT_JITTER_SECONDS`). Siempre se respeta
+`OCI_MIN_LAUNCH_GAP_SECONDS` (60 segundos por defecto).
 
 Una revisión vacía no cuenta como solicitud de creación y no llama a
-`existing_instance()`. Esa comprobación ocurre al iniciar, inmediatamente
-antes de cada solicitud real, después de un resultado ambiguo y cada
-`OCI_EXISTING_CHECK_INTERVAL_SECONDS` (15 minutos por defecto). La variable
-`OCI_MAX_ATTEMPTS` cuenta, en cada ejecución, llamadas HTTP reales a
-`launch_instance`, incluidos los reintentos del mismo request, no ciclos ni
-candidatos teóricos. El acumulado histórico queda en `runtime.json`.
+`existing_instance()`. La comprobación de instancia existente ocurre al iniciar,
+periódicamente cada `OCI_EXISTING_CHECK_INTERVAL_SECONDS` (15 minutos por defecto)
+y tras un resultado ambiguo (timeout o 5xx). Si la comprobación es fresca, no se
+repite inmediatamente antes de un intento de creación, permitiendo que una detección
+positiva del capacity report pase a `launch_instance` sin lecturas OCI intermedias
+que arriesguen un 429. La variable `OCI_MAX_ATTEMPTS` cuenta, en cada ejecución,
+llamadas HTTP reales a `launch_instance`, incluidos los reintentos del mismo request,
+no ciclos ni candidatos teóricos. El acumulado histórico y el ritmo adaptativo quedan
+en `runtime.json`.
 
 Un 429 es distinto de un error transitorio normal: activa un cooldown global
 que bloquea tanto lecturas como creaciones, respeta `Retry-After` y, si falta,
-usa backoff exponencial con jitter de 60 a 600 segundos. Un timeout, error de
-red o 5xx comprueba primero si apareció la instancia y, si no, programa el
-reintento del mismo candidato en un ciclo posterior con el mismo token. Nunca
-abre un candidato nuevo dentro de ese reintento.
+usa backoff exponencial con jitter de 60 a 600 segundos, incrementando además
+el intervalo adaptativo. Un timeout, error de red o 5xx comprueba primero si
+apareció la instancia y, si no, programa el reintento del mismo candidato en un
+ciclo posterior con el mismo token. Nunca abre un candidato nuevo dentro de ese
+reintento.
 
 Los fallos temporales del capacity report no lo desactivan: se reintenta
 después de su propio backoff. Solo una respuesta que indique que el endpoint no
 está autorizado, soportado o disponible para la cuenta lo desactiva durante
-esa ejecución; el fallback directo sigue rotando y espaciado.
+esa ejecución; el fallback directo sigue espaciado según la estrategia configurada.
 
 ## Requisitos
 

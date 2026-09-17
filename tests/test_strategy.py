@@ -141,7 +141,12 @@ class StrategyTest(unittest.TestCase):
             "ssh_public_key": "ssh-ed25519 AAAA-test",
             "assign_public_ip": True,
             "fault_domains": (),
+            "direct_fault_domain_mode": "auto",
             "capacity_report": False,
+            "capacity_candidate_ttl_seconds": 180,
+            "adaptive_direct_interval": True,
+            "adaptive_min_interval_seconds": 120,
+            "adaptive_max_interval_seconds": 600,
             "direct_fallback_every": 10,
             "interval_seconds": 60,
             "jitter_seconds": 0,
@@ -235,7 +240,7 @@ class StrategyTest(unittest.TestCase):
                 FakeError("Out of host capacity"),
             ]
         )
-        instance, clock = self.claimer(compute)
+        instance, clock = self.claimer(compute, direct_fault_domain_mode="rotate")
 
         self.run_direct(instance, clock, cycles=3)
 
@@ -252,6 +257,7 @@ class StrategyTest(unittest.TestCase):
         compute = FakeCompute(launch_results=[FakeError("Out of host capacity")])
         instance, clock = self.claimer(
             compute,
+            direct_fault_domain_mode="rotate",
             fault_domains=("CUSTOM-1", "CUSTOM-2"),
         )
         instance.run_cycle(once=True)
@@ -260,6 +266,7 @@ class StrategyTest(unittest.TestCase):
         restarted, _same_clock = self.claimer(
             FakeCompute(launch_results=[FakeError("Out of host capacity")]),
             clock=clock,
+            direct_fault_domain_mode="rotate",
             fault_domains=("CUSTOM-1", "CUSTOM-2"),
         )
         self.assertEqual(
@@ -274,7 +281,7 @@ class StrategyTest(unittest.TestCase):
     def test_default_interval_produces_about_fifteen_attempts_per_hour(self):
         clock = FakeClock()
         compute = FakeCompute(clock=clock)
-        instance, _clock = self.claimer(compute, clock=clock)
+        instance, _clock = self.claimer(compute, clock=clock, adaptive_direct_interval=False)
 
         for _cycle in range(60):
             instance.run_cycle(once=True)
@@ -301,6 +308,7 @@ class StrategyTest(unittest.TestCase):
         )
         instance, clock = self.claimer(
             compute,
+            adaptive_direct_interval=False,
             direct_attempt_interval_seconds=10,
             min_launch_gap_seconds=60,
         )
@@ -499,6 +507,320 @@ class StrategyTest(unittest.TestCase):
             len([event for event in instance.runtime["recent_events"] if event["type"] == "launch"]),
             1,
         )
+
+    # --- 1. Fault domain tests ---
+    def test_default_direct_fault_domain_is_auto(self):
+        instance, _clock = self.claimer(direct_fault_domain_mode="auto")
+        candidates = instance.fallback_candidates("AD-1")
+        self.assertEqual(len(candidates), 1)
+        self.assertIsNone(candidates[0].fault_domain)
+        consumed = instance._consume_direct_candidate("AD-1")
+        self.assertIsNone(consumed.fault_domain)
+
+    def test_launch_details_omits_fault_domain_when_none(self):
+        instance, _clock = self.claimer()
+        candidate = MODULE.Candidate("AD-1", None)
+        details = instance.launch_details(candidate)
+        self.assertIsNone(getattr(details, "fault_domain", None))
+
+    def test_capacity_candidate_preserves_explicit_fault_domain(self):
+        compute = FakeCompute(
+            capacity_results=[self.available_report("FAULT-DOMAIN-2")],
+            launch_results=[FakeError("Out of host capacity")],
+        )
+        instance, _clock = self.claimer(compute, capacity_report=True)
+        candidates = instance.capacity_candidates("AD-1")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].fault_domain, "FAULT-DOMAIN-2")
+        details = instance.launch_details(candidates[0])
+        self.assertEqual(details.fault_domain, "FAULT-DOMAIN-2")
+
+    def test_invalid_direct_fault_domain_mode_raises_configuration_error(self):
+        import os
+        old = os.environ.get("OCI_DIRECT_FAULT_DOMAIN_MODE")
+        old_comp = os.environ.get("OCI_COMPARTMENT_ID")
+        os.environ["OCI_COMPARTMENT_ID"] = "ocid1.compartment.test"
+        os.environ["OCI_DIRECT_FAULT_DOMAIN_MODE"] = "invalid_mode"
+        try:
+            with self.assertRaises(MODULE.ConfigurationError):
+                MODULE.Settings.from_env()
+        finally:
+            if old is None:
+                os.environ.pop("OCI_DIRECT_FAULT_DOMAIN_MODE", None)
+            else:
+                os.environ["OCI_DIRECT_FAULT_DOMAIN_MODE"] = old
+            if old_comp is None:
+                os.environ.pop("OCI_COMPARTMENT_ID", None)
+            else:
+                os.environ["OCI_COMPARTMENT_ID"] = old_comp
+
+    # --- 2. Existing instance check tests ---
+    def test_existing_instance_not_checked_before_launch_when_fresh(self):
+        compute = FakeCompute(launch_results=[FakeError("Out of host capacity")])
+        instance, clock = self.claimer(compute)
+        instance._set_runtime_time("last_existing_check", clock.time())
+        self.assertTrue(instance.existing_check_is_fresh(clock.time()))
+
+        instance.run_cycle(once=True)
+
+        self.assertEqual(compute.list_instances_calls, 0)
+        self.assertEqual(len(compute.launch_calls), 1)
+
+    def test_periodic_existing_instance_check_occurs(self):
+        compute = FakeCompute(
+            launch_results=[FakeError("Out of host capacity"), FakeError("Out of host capacity")]
+        )
+        instance, clock = self.claimer(compute, existing_check_interval_seconds=900)
+        instance._set_runtime_time("last_existing_check", clock.time())
+        instance.run_cycle(once=True)
+        self.assertEqual(compute.list_instances_calls, 0)
+
+        # Avanzamos más allá del intervalo periódico
+        clock.advance(905)
+        self.assertFalse(instance.existing_check_is_fresh(clock.time()))
+        instance.run_cycle(once=True)
+        self.assertEqual(compute.list_instances_calls, 1)
+
+    def test_ambiguous_error_triggers_reconciliation(self):
+        compute = FakeCompute(
+            launch_results=[TimeoutError("connection timed out")]
+        )
+        instance, clock = self.claimer(compute)
+        instance._set_runtime_time("last_existing_check", clock.time())
+
+        instance.run_cycle(once=True)
+
+        self.assertEqual(compute.list_instances_calls, 1)
+        self.assertEqual(len(compute.launch_calls), 1)
+
+    def test_capacity_hint_launches_without_intermediate_oci_read(self):
+        compute = FakeCompute(
+            capacity_results=[self.available_report("FAULT-DOMAIN-1")],
+            launch_results=[FakeError("Out of host capacity")],
+        )
+        instance, clock = self.claimer(compute, capacity_report=True)
+        instance._set_runtime_time("last_existing_check", clock.time())
+
+        instance.run_cycle(once=True)
+
+        self.assertEqual(compute.list_instances_calls, 0)
+        self.assertEqual(len(compute.launch_calls), 1)
+
+    def test_existing_state_file_prevents_duplicate_instance(self):
+        compute = FakeCompute(launch_results=[Obj(id="new-instance")])
+        instance, _clock = self.claimer(compute)
+        instance.settings.state_file.write_text('{"id": "existing-vm"}\n', encoding="utf-8")
+        instance.validated = True
+
+        result = instance.run(once=True)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(compute.launch_calls), 0)
+
+    # --- 3. Candidate TTL and ordering tests ---
+    def test_candidate_within_ttl_is_retained(self):
+        instance, clock = self.claimer(capacity_candidate_ttl_seconds=180)
+        now = clock.time()
+        cand = MODULE.Candidate("AD-1", "FAULT-DOMAIN-1", observed_at=now - 30)
+        instance._enqueue_candidates([cand], now=now)
+
+        pending = instance._pending_candidates(now=now)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].fault_domain, "FAULT-DOMAIN-1")
+
+    def test_candidate_expired_by_ttl_is_pruned(self):
+        instance, clock = self.claimer(capacity_candidate_ttl_seconds=180)
+        now = clock.time()
+        cand = MODULE.Candidate("AD-1", "FAULT-DOMAIN-1", observed_at=now - 200)
+        instance._enqueue_candidates([cand], now=now)
+
+        pending = instance._pending_candidates(now=now)
+        self.assertEqual(len(pending), 0)
+
+    def test_legacy_candidate_without_observed_at_treated_as_expired(self):
+        instance, clock = self.claimer(capacity_candidate_ttl_seconds=180)
+        instance.runtime["pending_candidates"] = [
+            {"availability_domain": "AD-1", "fault_domain": "FAULT-DOMAIN-1"}
+        ]
+        pending = instance._pending_candidates(now=clock.time())
+        self.assertEqual(len(pending), 0)
+
+    def test_duplicate_candidate_updates_timestamp_instead_of_duplicating(self):
+        instance, clock = self.claimer(capacity_candidate_ttl_seconds=180)
+        t1 = clock.time()
+        c1 = MODULE.Candidate("AD-1", "FAULT-DOMAIN-1", observed_at=t1, available_count=1)
+        instance._enqueue_candidates([c1], now=t1)
+
+        t2 = t1 + 40
+        c2 = MODULE.Candidate("AD-1", "FAULT-DOMAIN-1", observed_at=t2, available_count=2)
+        instance._enqueue_candidates([c2], now=t2)
+
+        pending = instance._pending_candidates(now=t2)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].observed_at, t2)
+        self.assertEqual(pending[0].available_count, 2)
+
+    def test_newer_candidate_has_priority_over_older(self):
+        instance, clock = self.claimer(capacity_candidate_ttl_seconds=180)
+        t1 = clock.time()
+        c_older = MODULE.Candidate("AD-1", "FAULT-DOMAIN-1", observed_at=t1)
+        c_newer = MODULE.Candidate("AD-1", "FAULT-DOMAIN-2", observed_at=t1 + 50)
+        instance._enqueue_candidates([c_older, c_newer], now=t1 + 50)
+
+        pending = instance._pending_candidates(now=t1 + 50)
+        self.assertEqual(len(pending), 2)
+        self.assertEqual(pending[0].fault_domain, "FAULT-DOMAIN-2")
+        self.assertEqual(pending[1].fault_domain, "FAULT-DOMAIN-1")
+
+    def test_out_of_host_capacity_consumes_and_discards_candidate(self):
+        compute = FakeCompute(
+            capacity_results=[self.available_report("FAULT-DOMAIN-1")],
+            launch_results=[FakeError("Out of host capacity")],
+        )
+        instance, clock = self.claimer(compute, capacity_report=True)
+        instance._set_runtime_time("last_existing_check", clock.time())
+
+        instance.run_cycle(once=True)
+
+        self.assertEqual(len(compute.launch_calls), 1)
+        self.assertEqual(len(instance.runtime["pending_candidates"]), 0)
+
+    # --- 4. Adaptive interval tests ---
+    def test_adaptive_interval_starts_at_base(self):
+        instance, _clock = self.claimer(
+            adaptive_direct_interval=True,
+            direct_attempt_interval_seconds=240,
+            adaptive_min_interval_seconds=120,
+            adaptive_max_interval_seconds=600,
+        )
+        self.assertEqual(instance.current_adaptive_direct_interval(), 240)
+
+    def test_consecutive_non_429_launches_gradually_reduce_interval(self):
+        compute = FakeCompute(
+            launch_results=[
+                FakeError("Out of host capacity"),
+                FakeError("Out of host capacity"),
+                FakeError("Out of host capacity"),
+            ]
+        )
+        instance, clock = self.claimer(
+            compute,
+            adaptive_direct_interval=True,
+            direct_attempt_interval_seconds=240,
+            adaptive_min_interval_seconds=120,
+            adaptive_max_interval_seconds=600,
+        )
+        instance._set_runtime_time("last_existing_check", clock.time())
+
+        # 1er launch (240 -> 225)
+        instance.run_cycle(once=True)
+        self.assertEqual(instance.current_adaptive_direct_interval(), 225)
+
+        # 2do launch (225 -> 210)
+        clock.advance(240)
+        instance.run_cycle(once=True)
+        self.assertEqual(instance.current_adaptive_direct_interval(), 210)
+
+        # 3er launch (210 -> 195)
+        clock.advance(240)
+        instance.run_cycle(once=True)
+        self.assertEqual(instance.current_adaptive_direct_interval(), 195)
+
+    def test_adaptive_interval_never_drops_below_minimum(self):
+        compute = FakeCompute(
+            launch_results=[FakeError("Out of host capacity") for _ in range(15)]
+        )
+        instance, clock = self.claimer(
+            compute,
+            adaptive_direct_interval=True,
+            direct_attempt_interval_seconds=150,
+            adaptive_min_interval_seconds=120,
+            adaptive_max_interval_seconds=600,
+        )
+        instance._set_runtime_time("last_existing_check", clock.time())
+
+        for _ in range(10):
+            instance.run_cycle(once=True)
+            clock.advance(300)
+
+        self.assertEqual(instance.current_adaptive_direct_interval(), 120)
+
+    def test_429_increases_adaptive_interval(self):
+        compute = FakeCompute(
+            launch_results=[FakeError("Too many requests", status=429, code="TooManyRequests")]
+        )
+        instance, clock = self.claimer(
+            compute,
+            adaptive_direct_interval=True,
+            direct_attempt_interval_seconds=180,
+            adaptive_min_interval_seconds=120,
+            adaptive_max_interval_seconds=600,
+        )
+        instance._set_runtime_time("last_existing_check", clock.time())
+
+        instance.run_cycle(once=True)
+
+        # 180 * 1.5 = 270
+        self.assertEqual(instance.current_adaptive_direct_interval(), 270)
+
+    def test_adaptive_interval_never_exceeds_maximum(self):
+        instance, clock = self.claimer(
+            adaptive_direct_interval=True,
+            direct_attempt_interval_seconds=400,
+            adaptive_min_interval_seconds=120,
+            adaptive_max_interval_seconds=600,
+        )
+        # 400 * 1.5 = 600
+        instance.activate_rate_limit(
+            FakeError("Too many requests", status=429, code="TooManyRequests"),
+            "test",
+        )
+        self.assertEqual(instance.current_adaptive_direct_interval(), 600)
+
+        # 600 * 1.5 = 900 -> capped at 600
+        instance.activate_rate_limit(
+            FakeError("Too many requests", status=429, code="TooManyRequests"),
+            "test",
+        )
+        self.assertEqual(instance.current_adaptive_direct_interval(), 600)
+
+    def test_adaptive_interval_persists_across_restarts(self):
+        settings = self.settings(
+            adaptive_direct_interval=True,
+            direct_attempt_interval_seconds=240,
+            adaptive_min_interval_seconds=120,
+            adaptive_max_interval_seconds=600,
+        )
+        clock = FakeClock()
+        instance = MODULE.Claimer(settings, clock=clock, rng=MidpointRandom())
+        instance.runtime["adaptive_direct_interval_seconds"] = 195
+        instance.save_runtime()
+
+        restarted = MODULE.Claimer(settings, clock=clock, rng=MidpointRandom())
+        self.assertEqual(restarted.current_adaptive_direct_interval(), 195)
+
+    def test_adaptive_disabled_uses_fixed_interval(self):
+        compute = FakeCompute(
+            launch_results=[
+                FakeError("Out of host capacity"),
+                FakeError("Too many requests", status=429, code="TooManyRequests"),
+            ]
+        )
+        instance, clock = self.claimer(
+            compute,
+            adaptive_direct_interval=False,
+            direct_attempt_interval_seconds=240,
+        )
+        instance._set_runtime_time("last_existing_check", clock.time())
+
+        # Non-429 launch
+        instance.run_cycle(once=True)
+        self.assertEqual(instance.current_adaptive_direct_interval(), 240)
+
+        # 429 launch
+        clock.advance(250)
+        instance.run_cycle(once=True)
+        self.assertEqual(instance.current_adaptive_direct_interval(), 240)
 
 
 if __name__ == "__main__":

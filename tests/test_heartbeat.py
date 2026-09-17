@@ -217,6 +217,23 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("command not found", result.stderr)
 
+    def test_heartbeat_includes_adaptive_interval_and_fresh_candidates(self):
+        runtime = self.limited_runtime()
+        runtime["adaptive_direct_interval_seconds"] = 195
+        runtime["pending_candidates"] = [
+            {
+                "availability_domain": "AD-1",
+                "fault_domain": "FAULT-DOMAIN-2",
+                "observed_at": self.timestamp(-30),
+                "available_count": 1,
+            }
+        ]
+        result, captured = self.run_heartbeat(runtime=runtime)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("⏱ Intervalo directo actual: 195 s", captured)
+        self.assertIn("⚡ Candidatos capacity frescos: 1", captured)
+
 
 if __name__ == "__main__":
     unittest.main()

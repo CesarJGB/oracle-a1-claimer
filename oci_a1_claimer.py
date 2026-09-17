@@ -341,7 +341,12 @@ class Settings:
     ssh_public_key: Optional[str]
     assign_public_ip: bool
     fault_domains: tuple[str, ...]
+    direct_fault_domain_mode: str
     capacity_report: bool
+    capacity_candidate_ttl_seconds: int
+    adaptive_direct_interval: bool
+    adaptive_min_interval_seconds: int
+    adaptive_max_interval_seconds: int
     direct_fallback_every: int
     interval_seconds: int
     jitter_seconds: int
@@ -386,6 +391,49 @@ class Settings:
             os.getenv("OCI_LOCK_FILE", str(state_file.with_suffix(".lock")))
         ).expanduser()
 
+        direct_fault_domain_mode = os.getenv(
+            "OCI_DIRECT_FAULT_DOMAIN_MODE", "auto"
+        ).strip().lower()
+        if not direct_fault_domain_mode:
+            direct_fault_domain_mode = "auto"
+        if direct_fault_domain_mode not in {"auto", "rotate"}:
+            raise ConfigurationError(
+                f"OCI_DIRECT_FAULT_DOMAIN_MODE debe ser 'auto' o 'rotate'; recibí {direct_fault_domain_mode!r}."
+            )
+
+        capacity_candidate_ttl_seconds = parse_int(
+            "OCI_CAPACITY_CANDIDATE_TTL_SECONDS", 180, 1
+        )
+        adaptive_direct_interval = parse_bool(
+            os.getenv("OCI_ADAPTIVE_DIRECT_INTERVAL"), True
+        )
+        adaptive_min_interval_seconds = parse_int(
+            "OCI_ADAPTIVE_MIN_INTERVAL_SECONDS", 120, 1
+        )
+        adaptive_max_interval_seconds = parse_int(
+            "OCI_ADAPTIVE_MAX_INTERVAL_SECONDS", 600, 1
+        )
+        if adaptive_max_interval_seconds < adaptive_min_interval_seconds:
+            raise ConfigurationError(
+                f"OCI_ADAPTIVE_MAX_INTERVAL_SECONDS ({adaptive_max_interval_seconds}) "
+                f"debe ser >= OCI_ADAPTIVE_MIN_INTERVAL_SECONDS ({adaptive_min_interval_seconds})."
+            )
+
+        direct_attempt_interval_seconds = parse_int(
+            "OCI_DIRECT_ATTEMPT_INTERVAL_SECONDS", 240, 1
+        )
+        if adaptive_direct_interval:
+            if direct_attempt_interval_seconds < adaptive_min_interval_seconds:
+                raise ConfigurationError(
+                    f"OCI_DIRECT_ATTEMPT_INTERVAL_SECONDS ({direct_attempt_interval_seconds}) "
+                    f"debe ser >= OCI_ADAPTIVE_MIN_INTERVAL_SECONDS ({adaptive_min_interval_seconds})."
+                )
+            if direct_attempt_interval_seconds > adaptive_max_interval_seconds:
+                raise ConfigurationError(
+                    f"OCI_DIRECT_ATTEMPT_INTERVAL_SECONDS ({direct_attempt_interval_seconds}) "
+                    f"debe ser <= OCI_ADAPTIVE_MAX_INTERVAL_SECONDS ({adaptive_max_interval_seconds})."
+                )
+
         return cls(
             region=os.getenv("OCI_REGION", "mx-monterrey-1").strip(),
             profile=os.getenv("OCI_PROFILE", "DEFAULT").strip(),
@@ -408,15 +456,18 @@ class Settings:
             ssh_public_key=ssh_key_raw or None,
             assign_public_ip=parse_bool(os.getenv("OCI_ASSIGN_PUBLIC_IP"), True),
             fault_domains=parse_csv(os.getenv("OCI_FALLBACK_FAULT_DOMAINS")),
+            direct_fault_domain_mode=direct_fault_domain_mode,
             capacity_report=parse_bool(os.getenv("OCI_CAPACITY_REPORT"), True),
+            capacity_candidate_ttl_seconds=capacity_candidate_ttl_seconds,
+            adaptive_direct_interval=adaptive_direct_interval,
+            adaptive_min_interval_seconds=adaptive_min_interval_seconds,
+            adaptive_max_interval_seconds=adaptive_max_interval_seconds,
             # Kept as a compatibility setting; direct attempts are now timed
             # by OCI_DIRECT_ATTEMPT_INTERVAL_SECONDS instead of cycle counts.
             direct_fallback_every=parse_int("OCI_DIRECT_FALLBACK_EVERY", 10, 1),
             interval_seconds=parse_int("OCI_INTERVAL_SECONDS", 60, 15),
             jitter_seconds=parse_int("OCI_JITTER_SECONDS", 15, 0),
-            direct_attempt_interval_seconds=parse_int(
-                "OCI_DIRECT_ATTEMPT_INTERVAL_SECONDS", 240, 1
-            ),
+            direct_attempt_interval_seconds=direct_attempt_interval_seconds,
             direct_attempt_jitter_seconds=parse_int(
                 "OCI_DIRECT_ATTEMPT_JITTER_SECONDS", 30, 0
             ),
@@ -441,7 +492,9 @@ class Settings:
 @dataclass(frozen=True)
 class Candidate:
     availability_domain: str
-    fault_domain: Optional[str]
+    fault_domain: Optional[str] = None
+    observed_at: Optional[float] = dataclasses.field(default=None, compare=False)
+    available_count: Optional[int] = dataclasses.field(default=None, compare=False)
 
 
 class Claimer:
@@ -514,6 +567,7 @@ class Claimer:
             "last_real_attempt": None,
             "next_attempt_allowed": None,
             "fault_domain_index": 0,
+            "adaptive_direct_interval_seconds": self.settings.direct_attempt_interval_seconds,
             "cooldown_until": None,
             "consecutive_429": 0,
             "capacity_report_backoff_until": None,
@@ -571,6 +625,21 @@ class Claimer:
             runtime["total_real_attempts"] = max(0, int(runtime["total_real_attempts"]))
         except (KeyError, TypeError, ValueError):
             runtime["total_real_attempts"] = 0
+        try:
+            adaptive_val = int(
+                runtime.get(
+                    "adaptive_direct_interval_seconds",
+                    self.settings.direct_attempt_interval_seconds,
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            adaptive_val = self.settings.direct_attempt_interval_seconds
+        if self.settings.adaptive_direct_interval:
+            adaptive_val = max(
+                self.settings.adaptive_min_interval_seconds,
+                min(self.settings.adaptive_max_interval_seconds, adaptive_val),
+            )
+        runtime["adaptive_direct_interval_seconds"] = adaptive_val
         return runtime
 
     def _prune_events(self, now: Optional[float] = None) -> None:
@@ -676,9 +745,57 @@ class Claimer:
             return lower
         return float(self.rng.uniform(lower, upper))
 
+    def current_adaptive_direct_interval(self) -> int:
+        if not self.settings.adaptive_direct_interval:
+            return self.settings.direct_attempt_interval_seconds
+        val = self.runtime.get("adaptive_direct_interval_seconds")
+        try:
+            current = (
+                int(val)
+                if val is not None
+                else self.settings.direct_attempt_interval_seconds
+            )
+        except (TypeError, ValueError):
+            current = self.settings.direct_attempt_interval_seconds
+        return max(
+            self.settings.adaptive_min_interval_seconds,
+            min(self.settings.adaptive_max_interval_seconds, current),
+        )
+
+    def _adapt_interval_on_429(self) -> None:
+        if not self.settings.adaptive_direct_interval:
+            return
+        current = self.current_adaptive_direct_interval()
+        new_val = min(
+            self.settings.adaptive_max_interval_seconds,
+            int(round(current * 1.5)),
+        )
+        self.runtime["adaptive_direct_interval_seconds"] = new_val
+        self.save_runtime()
+        LOG.info(
+            "Ritmo directo adaptativo incrementado a %d s debido a HTTP 429.",
+            new_val,
+        )
+
+    def _adapt_interval_on_non_429_launch(self) -> None:
+        if not self.settings.adaptive_direct_interval:
+            return
+        current = self.current_adaptive_direct_interval()
+        new_val = max(
+            self.settings.adaptive_min_interval_seconds,
+            current - 15,
+        )
+        self.runtime["adaptive_direct_interval_seconds"] = new_val
+        self.save_runtime()
+        if new_val != current:
+            LOG.debug(
+                "Ritmo directo adaptativo reducido gradualmente a %d s.",
+                new_val,
+            )
+
     def _direct_delay(self) -> float:
         jitter = self.settings.direct_attempt_jitter_seconds
-        delay = self.settings.direct_attempt_interval_seconds
+        delay = float(self.current_adaptive_direct_interval())
         if jitter:
             delay += self._random_between(-jitter, jitter)
         return max(float(self.settings.min_launch_gap_seconds), delay)
@@ -720,6 +837,7 @@ class Claimer:
         self._set_runtime_time("cooldown_until", until)
         next_allowed = self._runtime_time("next_attempt_allowed") or 0.0
         self._set_runtime_time("next_attempt_allowed", max(next_allowed, until))
+        self._adapt_interval_on_429()
         self.save_runtime()
         LOG.warning(
             "HTTP 429 en %s; API limitada, ritmo reducido automáticamente durante %s.",
@@ -1104,21 +1222,31 @@ class Claimer:
                 return instance
         return None
 
-    def should_check_existing(self) -> bool:
+    def existing_check_is_fresh(self, now: Optional[float] = None) -> bool:
+        current = self.now() if now is None else now
         last = self._runtime_time("last_existing_check")
-        return last is None or self.now() - last >= self.settings.existing_check_interval_seconds
+        if last is None:
+            return False
+        return (current - last) < self.settings.existing_check_interval_seconds
+
+    def should_check_existing(self, now: Optional[float] = None) -> bool:
+        return not self.existing_check_is_fresh(now)
 
     def _fault_domain_names(self) -> tuple[str, ...]:
         return self.settings.fault_domains or DEFAULT_FAULT_DOMAINS
 
     def fallback_candidates(self, availability_domain: str) -> list[Candidate]:
-        """Return one persisted, rotating direct-placement candidate only."""
+        """Return one direct-placement candidate (auto or rotating fault domain)."""
 
+        if self.settings.direct_fault_domain_mode == "auto":
+            return [Candidate(availability_domain, None)]
         domains = self._fault_domain_names()
         index = self._runtime_int("fault_domain_index", 0) % len(domains)
         return [Candidate(availability_domain, domains[index])]
 
     def _consume_direct_candidate(self, availability_domain: str) -> Candidate:
+        if self.settings.direct_fault_domain_mode == "auto":
+            return Candidate(availability_domain, None)
         domains = self._fault_domain_names()
         index = self._runtime_int("fault_domain_index", 0) % len(domains)
         candidate = Candidate(availability_domain, domains[index])
@@ -1126,43 +1254,110 @@ class Claimer:
         self.save_runtime()
         return candidate
 
-    def _pending_candidates(self) -> list[Candidate]:
-        candidates: list[Candidate] = []
-        for raw in self.runtime.get("pending_candidates", []):
-            if not isinstance(raw, dict):
-                continue
-            availability_domain = raw.get("availability_domain")
-            if not availability_domain:
-                continue
-            candidate = Candidate(availability_domain, raw.get("fault_domain"))
-            if candidate not in candidates:
-                candidates.append(candidate)
-        return candidates
-
-    def _enqueue_candidates(self, candidates: Iterable[Candidate]) -> None:
-        pending = self._pending_candidates()
+    def _save_pending_candidates(self, candidates: list[Candidate]) -> None:
+        serialized = []
         for candidate in candidates:
-            if candidate not in pending:
-                pending.append(candidate)
-        self.runtime["pending_candidates"] = [
-            {
+            item: dict[str, Any] = {
                 "availability_domain": candidate.availability_domain,
                 "fault_domain": candidate.fault_domain,
             }
-            for candidate in pending
-        ]
+            if candidate.observed_at is not None:
+                item["observed_at"] = utc_timestamp(candidate.observed_at)
+            if candidate.available_count is not None:
+                item["available_count"] = candidate.available_count
+            serialized.append(item)
+        self.runtime["pending_candidates"] = serialized
         self.save_runtime()
 
+    def _pending_candidates(self, now: Optional[float] = None) -> list[Candidate]:
+        current = self.now() if now is None else now
+        ttl = self.settings.capacity_candidate_ttl_seconds
+        valid: list[Candidate] = []
+        has_pruned = False
+
+        for raw in self.runtime.get("pending_candidates", []):
+            if not isinstance(raw, dict):
+                has_pruned = True
+                continue
+            ad = raw.get("availability_domain")
+            if not ad:
+                has_pruned = True
+                continue
+            fd = raw.get("fault_domain")
+            observed_at = parse_timestamp(raw.get("observed_at"))
+            # Hints sin observed_at (formato antiguo) o vencidos por TTL se descartan
+            if observed_at is None:
+                has_pruned = True
+                continue
+            if current - observed_at > ttl:
+                has_pruned = True
+                continue
+            available_count = raw.get("available_count")
+            try:
+                available_count = (
+                    int(available_count) if available_count is not None else None
+                )
+            except (TypeError, ValueError):
+                available_count = None
+
+            cand = Candidate(
+                availability_domain=ad,
+                fault_domain=fd,
+                observed_at=observed_at,
+                available_count=available_count,
+            )
+            if cand not in valid:
+                valid.append(cand)
+            else:
+                has_pruned = True
+
+        # Ordenar: más recientes primero (mayor observed_at)
+        valid.sort(key=lambda c: (c.observed_at or 0.0), reverse=True)
+
+        if has_pruned:
+            self._save_pending_candidates(valid)
+
+        return valid
+
+    def _enqueue_candidates(
+        self,
+        candidates: Iterable[Candidate],
+        now: Optional[float] = None,
+    ) -> None:
+        current = self.now() if now is None else now
+        current_valid = self._pending_candidates(current)
+        by_placement: dict[tuple[str, Optional[str]], Candidate] = {
+            (c.availability_domain, c.fault_domain): c
+            for c in current_valid
+        }
+
+        for candidate in candidates:
+            key = (candidate.availability_domain, candidate.fault_domain)
+            obs = candidate.observed_at if candidate.observed_at is not None else current
+            by_placement[key] = Candidate(
+                availability_domain=candidate.availability_domain,
+                fault_domain=candidate.fault_domain,
+                observed_at=obs,
+                available_count=candidate.available_count,
+            )
+
+        sorted_candidates = sorted(
+            by_placement.values(),
+            key=lambda c: (c.observed_at or 0.0),
+            reverse=True,
+        )
+        self._save_pending_candidates(sorted_candidates)
+
     def _remove_pending_candidate(self, candidate: Candidate) -> None:
-        pending = [item for item in self._pending_candidates() if item != candidate]
-        self.runtime["pending_candidates"] = [
-            {
-                "availability_domain": item.availability_domain,
-                "fault_domain": item.fault_domain,
-            }
-            for item in pending
+        pending = [
+            item
+            for item in self._pending_candidates()
+            if not (
+                item.availability_domain == candidate.availability_domain
+                and item.fault_domain == candidate.fault_domain
+            )
         ]
-        self.save_runtime()
+        self._save_pending_candidates(pending)
 
     def _retry_context(self) -> Optional[dict[str, Any]]:
         raw = self.runtime.get("pending_retry")
@@ -1294,10 +1489,16 @@ class Claimer:
             except (TypeError, ValueError):
                 count_is_positive = False
             if status == "AVAILABLE" and count_is_positive:
+                try:
+                    count_val = int(count) if count is not None else None
+                except (TypeError, ValueError):
+                    count_val = None
                 candidates.append(
                     Candidate(
                         availability_domain,
                         attr(availability, "fault_domain", None),
+                        observed_at=report_started,
+                        available_count=count_val,
                     )
                 )
 
@@ -1421,6 +1622,7 @@ class Claimer:
                 retry_strategy=oci.retry.NoneRetryStrategy(),
             )
             self._record_non_429_response()
+            self._adapt_interval_on_non_429_launch()
             self._clear_retry_context()
             self._record_launch_result(
                 "created",
@@ -1449,6 +1651,7 @@ class Claimer:
             if is_capacity_error(exc):
                 self._clear_retry_context()
                 self._record_non_429_response()
+                self._adapt_interval_on_non_429_launch()
                 self._record_launch_result(
                     "out_of_capacity",
                     candidate,
@@ -1476,6 +1679,7 @@ class Claimer:
             self._record_non_429_response()
             if existing:
                 self._clear_retry_context()
+                self._adapt_interval_on_non_429_launch()
                 self._record_launch_result(
                     "created",
                     candidate,
@@ -1489,6 +1693,7 @@ class Claimer:
 
             if not is_transient_error(exc):
                 self._clear_retry_context()
+                self._adapt_interval_on_non_429_launch()
                 self._record_launch_result(
                     "fatal_error",
                     candidate,
@@ -1510,6 +1715,7 @@ class Claimer:
                 source=source,
                 now=self.now(),
             )
+            self._adapt_interval_on_non_429_launch()
             LOG.warning(
                 "Error transitorio al crear (%d/%d): %s",
                 retry_index + 1,
@@ -1572,19 +1778,29 @@ class Claimer:
         source: str,
         once: bool,
     ) -> bool:
+        if self.settings.state_file.exists():
+            LOG.info(
+                "El archivo de estado %s ya existe con una instancia creada; "
+                "no lanzaré otra.",
+                self.settings.state_file,
+            )
+            return True
+
         if not self._launch_allowed(capacity_hint=source == "capacity"):
             return False
-        try:
-            existing = self.existing_instance()
-        except RateLimitedError:
-            return False
-        except TemporaryCloudError as exc:
-            LOG.warning("%s", exc)
-            return False
-        if existing:
-            if not self.settings.state_file.exists():
-                self.finish(existing)
-            return True
+
+        if not self.existing_check_is_fresh():
+            try:
+                existing = self.existing_instance()
+            except RateLimitedError:
+                return False
+            except TemporaryCloudError as exc:
+                LOG.warning("%s", exc)
+                return False
+            if existing:
+                if not self.settings.state_file.exists():
+                    self.finish(existing)
+                return True
 
         # A capacity candidate is removed only when it is actually selected.
         # The remaining report candidates stay in runtime.json for later cycles.
@@ -1832,6 +2048,13 @@ class Claimer:
         """Run after main has completed the one-time full validation."""
 
         try:
+            if self.settings.state_file.exists():
+                LOG.info(
+                    "Ya existe el archivo de estado %s con instancia creada; no intentaré crear otra.",
+                    self.settings.state_file,
+                )
+                return 0
+
             try:
                 existing = self.existing_instance()
             except RateLimitedError:

@@ -69,7 +69,7 @@ import json
 import sys
 with open(sys.argv[1], "r", encoding="utf-8") as stream:
     value = json.load(stream)
-if not isinstance(value, dict) or value.get("format_version") != 1:
+if not isinstance(value, dict) or value.get("format_version") not in (1, 2):
     raise SystemExit(1)
 ' "${RUNTIME_FILE}" 2>/dev/null; then
     logs_last_hour="$(
@@ -100,7 +100,7 @@ runtime = None
 try:
     with open(runtime_path, "r", encoding="utf-8") as stream:
         candidate = json.load(stream)
-    if isinstance(candidate, dict) and candidate.get("format_version") == 1:
+    if isinstance(candidate, dict) and candidate.get("format_version") in (1, 2):
         runtime = candidate
 except (OSError, ValueError, TypeError, json.JSONDecodeError):
     runtime = None
@@ -246,6 +246,27 @@ if runtime is not None:
 other = requests - created - no_capacity - rate_limited
 percentage = (100.0 * rate_limited / requests) if requests else 0.0
 
+extra_status = []
+if runtime is not None:
+    adaptive_interval = runtime.get("adaptive_direct_interval_seconds")
+    if adaptive_interval is not None:
+        try:
+            extra_status.append(f"⏱ Intervalo directo actual: {int(adaptive_interval)} s")
+        except (TypeError, ValueError):
+            pass
+    pending_list = runtime.get("pending_candidates", [])
+    if isinstance(pending_list, list):
+        fresh_count = 0
+        for cand in pending_list:
+            if isinstance(cand, dict):
+                obs = timestamp(cand.get("observed_at"))
+                if obs is not None and (now - obs) <= 180:
+                    fresh_count += 1
+        if fresh_count > 0:
+            extra_status.append(f"⚡ Candidatos capacity frescos: {fresh_count}")
+
+extra_block = ("\n" + "\n".join(extra_status)) if extra_status else ""
+
 active_for = duration(now - started) if started is not None else "tiempo no disponible"
 api_line = (
     "🟠 API limitada: ritmo reducido automáticamente"
@@ -262,7 +283,8 @@ message = (
     f"📭 Sin capacidad: {no_capacity}\n"
     f"⚠️ Limitadas por Oracle: {rate_limited} ({percentage:.1f} %)\n"
     f"❌ Otros errores: {other}\n"
-    f"{api_line}\n"
+    f"{api_line}"
+    f"{extra_block}\n"
     "Estado: esperando capacidad; no necesitas hacer nada.\n"
     f"Próximo intento real: {visible_time(next_allowed)}"
 )
